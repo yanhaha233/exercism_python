@@ -1,0 +1,136 @@
+name: Auto-merge Exercism sync PRs
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: auto-merge-exercism-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate and merge Exercism PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          TITLE: ${{ github.event.pull_request.title }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          comment() {
+            gh pr comment "$PR" --repo "$REPO" --body "$1" || true
+          }
+
+          if [[ "$AUTHOR" != "exercism-solutions-syncer[bot]" ]]; then
+            echo "Skip: not Exercism sync bot."
+            exit 0
+          fi
+
+          if [[ "$TITLE" != \[Sync\ * ]]; then
+            echo "Skip: title is not a sync PR."
+            exit 0
+          fi
+
+          if [[ "$HEAD_REF" != exercism-sync/* ]]; then
+            comment "Auto-merge skipped: source branch is not an Exercism sync branch."
+            exit 0
+          fi
+
+          if [[ "$BASE_REF" != "main" ]]; then
+            comment "Auto-merge skipped: base branch is not main."
+            exit 0
+          fi
+
+          if [[ "$DRAFT" == "true" ]]; then
+            echo "Skip: PR is draft."
+            exit 0
+          fi
+
+          echo "Checking changed files..."
+          mapfile -t files < <(gh pr diff "$PR" --repo "$REPO" --name-only)
+
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            comment "Auto-merge skipped: PR has no changed files."
+            exit 0
+          fi
+
+          for file in "${files[@]}"; do
+            if [[ "$file" != solutions/* ]]; then
+              comment "Auto-merge skipped: changed file outside allowed Exercism backup path: \`$file\`."
+              exit 0
+            fi
+          done
+
+          echo "Checking reviews..."
+          changes_requested="$(
+            gh api "repos/$REPO/pulls/$PR/reviews" \
+              --jq '[.[] | select(.state == "CHANGES_REQUESTED")] | length'
+          )"
+
+          if [[ "$changes_requested" != "0" ]]; then
+            comment "Auto-merge skipped: this PR has a changes-requested review."
+            exit 0
+          fi
+
+          echo "Checking human comments..."
+          human_comments="$(
+            gh api "repos/$REPO/issues/$PR/comments" \
+              --jq '[.[] | select(.user.login != "exercism-solutions-syncer[bot]" and .user.login != "github-actions[bot]")] | length'
+          )"
+
+          if [[ "$human_comments" != "0" ]]; then
+            echo "Skip: human comments exist, leaving PR for manual review."
+            exit 0
+          fi
+
+          echo "Checking failed checks..."
+          failed_checks="$(
+            gh api -H "Accept: application/vnd.github+json" \
+              "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+              --jq '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required")] | length'
+          )"
+
+          if [[ "$failed_checks" != "0" ]]; then
+            comment "Auto-merge skipped: one or more checks failed or were cancelled."
+            exit 0
+          fi
+
+          echo "Waiting for GitHub mergeability result..."
+          mergeable="null"
+          for i in {1..10}; do
+            mergeable="$(gh api "repos/$REPO/pulls/$PR" --jq '.mergeable')"
+            if [[ "$mergeable" != "null" ]]; then
+              break
+            fi
+            sleep 3
+          done
+
+          if [[ "$mergeable" != "true" ]]; then
+            comment "Auto-merge skipped: GitHub does not currently report this PR as mergeable."
+            exit 0
+          fi
+
+          echo "Merging PR #$PR at head $HEAD_SHA..."
+          gh pr merge "$PR" \
+            --repo "$REPO" \
+            --merge \
+            --match-head-commit "$HEAD_SHA"
